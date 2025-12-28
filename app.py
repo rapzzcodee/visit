@@ -3,7 +3,7 @@ import aiohttp
 import asyncio
 import json
 from byte import encrypt_api, Encrypt_ID
-from visit_count_pb2 import Info  # Import the generated protobuf class
+from visit_count_pb2 import Info
 
 app = Flask(__name__)
 
@@ -19,10 +19,14 @@ def load_tokens(server_name):
         with open(path, "r") as f:
             data = json.load(f)
 
-        tokens = [item["token"] for item in data if "token" in item and item["token"] not in ["", "N/A"]]
+        tokens = [
+            item["token"]
+            for item in data
+            if "token" in item and item["token"] not in ("", "N/A")
+        ]
         return tokens
     except Exception as e:
-        app.logger.error(f"❌ Token load error for {server_name}: {e}")
+        app.logger.error(f"Token load error {server_name}: {e}")
         return []
 
 def get_url(server_name):
@@ -37,103 +41,100 @@ def parse_protobuf_response(response_data):
     try:
         info = Info()
         info.ParseFromString(response_data)
-        
-        player_data = {
-            "uid": info.AccountInfo.UID if info.AccountInfo.UID else 0,
-            "nickname": info.AccountInfo.PlayerNickname if info.AccountInfo.PlayerNickname else "",
-            "likes": info.AccountInfo.Likes if info.AccountInfo.Likes else 0,
-            "region": info.AccountInfo.PlayerRegion if info.AccountInfo.PlayerRegion else "",
-            "level": info.AccountInfo.Levels if info.AccountInfo.Levels else 0
+
+        return {
+            "uid": info.AccountInfo.UID or 0,
+            "nickname": info.AccountInfo.PlayerNickname or "",
+            "likes": info.AccountInfo.Likes or 0,
+            "region": info.AccountInfo.PlayerRegion or "",
+            "level": info.AccountInfo.Levels or 0
         }
-        return player_data
     except Exception as e:
-        app.logger.error(f"❌ Protobuf parsing error: {e}")
+        app.logger.error(f"Protobuf error: {e}")
         return None
 
-async def visit(session, url, token, uid, data):
+async def visit(session, url, token, data):
     headers = {
         "ReleaseVersion": "OB51",
         "X-GA": "v1 1",
         "Authorization": f"Bearer {token}",
         "Host": url.replace("https://", "").split("/")[0]
     }
+
     try:
         async with session.post(url, headers=headers, data=data, ssl=False) as resp:
             if resp.status == 200:
-                response_data = await resp.read()
-                return True, response_data
-            else:
-                return False, None
-    except Exception as e:
-        app.logger.error(f"❌ Visit error: {e}")
+                return True, await resp.read()
+            return False, None
+    except Exception:
         return False, None
 
-async def send_until_1000_success(tokens, uid, server_name, target_success=5000):
-    url = get_url(server_name)
+async def send_until_success(tokens, uid, server, target_success):
+    url = get_url(server)
     connector = aiohttp.TCPConnector(limit=0)
+
     total_success = 0
     total_sent = 0
-    first_success_response = None
     player_info = None
+    first_response = None
+
+    encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
+    data = bytes.fromhex(encrypted)
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
-        data = bytes.fromhex(encrypted)
-
         while total_success < target_success:
-            batch_size = min(target_success - total_success, 10000)
-            tasks = [
-                asyncio.create_task(visit(session, url, tokens[(total_sent + i) % len(tokens)], uid, data))
-                for i in range(batch_size)
-            ]
-            results = await asyncio.gather(*tasks)
-            
-            if first_success_response is None:
-                for success, response in results:
-                    if success and response is not None:
-                        first_success_response = response
-                        player_info = parse_protobuf_response(response)
-                        break
-            
-            batch_success = sum(1 for r, _ in results if r)
-            total_success += batch_success
-            total_sent += batch_size
+            batch = min(10000, target_success - total_success)
 
-            print(f"Batch sent: {batch_size}, Success in batch: {batch_success}, Total success so far: {total_success}")
+            tasks = [
+                asyncio.create_task(
+                    visit(session, url, tokens[(total_sent + i) % len(tokens)], data)
+                )
+                for i in range(batch)
+            ]
+
+            results = await asyncio.gather(*tasks)
+
+            if not first_response:
+                for ok, res in results:
+                    if ok and res:
+                        first_response = res
+                        player_info = parse_protobuf_response(res)
+                        break
+
+            success_batch = sum(1 for ok, _ in results if ok)
+            total_success += success_batch
+            total_sent += batch
 
     return total_success, total_sent, player_info
 
-@app.route('/<string:server>/<int:uid>', methods=['GET'])
+@app.route("/<string:server>/<int:uid>", methods=["GET"])
 def send_visits(server, uid):
     server = server.upper()
     tokens = load_tokens(server)
     target_success = 10000
 
     if not tokens:
-        return jsonify({"error": "❌ No valid tokens found"}), 500
+        return jsonify({"error": "No valid tokens"}), 500
 
-    print(f"🚀 Sending visits to UID: {uid} using {len(tokens)} tokens")
-    print(f"Waiting for total {target_success} successful visits...")
+    total_success, total_sent, player_info = asyncio.run(
+        send_until_success(tokens, uid, server, target_success)
+    )
 
-    total_success, total_sent, player_info = asyncio.run(send_until_1000_success(
-        tokens, uid, server,
-        target_success=target_success
-    ))
+    if not player_info:
+        return jsonify({"error": "Player info not found"}), 500
 
-    if player_info:
-        player_info_response = {
-            "fail": target_success - total_success,
-            "level": player_info.get("level", 0),
-            "likes": player_info.get("likes", 0),
-            "nickname": player_info.get("nickname", ""),
-            "region": player_info.get("region", ""),
-            "success": total_success,
-            "uid": player_info.get("uid", 0)
-            "credit": "@RapzzGege"
-        }
-        return jsonify(player_info_response), 200
-    else:
-        return jsonify({"error": "Could not decode player information"}), 500
+    response = {
+        "uid": player_info.get("uid", 0),
+        "nickname": player_info.get("nickname", ""),
+        "level": player_info.get("level", 0),
+        "likes": player_info.get("likes", 0),
+        "region": player_info.get("region", ""),
+        "success": total_success,
+        "fail": target_success - total_success,
+        "credit": "@RapzzGege"
+    }
+
+    return jsonify(response), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
